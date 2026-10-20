@@ -29,7 +29,7 @@ Login → UserCreateCharacter → TutorialEnterReq → EnterScene(Hub_Village_Tu
 ## Files Modified
 - `akaneiro-local-server/auth_server.py` - Web login endpoint added
 - `akaneiro-local-server/game_server.py` - All handlers, DB schema, multi-packet responses
-- `akaneiro-local-server/docs/FACTS.md` - Project documentation
+- `FACTS.md` - Project documentation
 - `akaneiro-local-server/docs/ERRORS.md` - Client-side bugs documented
 
 ## Next Steps

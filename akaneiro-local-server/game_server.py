@@ -26,6 +26,10 @@ import sqlite3
 import os
 import random
 
+# Import scene management modules
+sys.path.insert(0, os.path.dirname(__file__))
+from scene_manager import load_scene_data, GateManager, TriggerManager
+
 # Use script directory for database path so it works from any working directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -107,6 +111,9 @@ PROCESS_REDEEM_GIFT = 0x73d1bffd
 PROCESS_REDEEM_GIFT_RESULT = 0x1ac4bcb6
 REQUEST_BAG_INFO = 0x103f2625
 SEND_BAG_INFO = 0x79d003d4
+NOTIFY_ITEM_SWAP = 0x50234afd
+NOTIFY_ITEM_UPDATE = 0xa69ab9f
+NOTIFY_ITEM_DESTROY = 0xf602bc8
 REQUEST_PLAYER_CONSUME_SHOP_INFO = 0x4e24fd8a
 SEND_SHOP_CONSUME_ITEMINFO = 0x8b9884d
 REQUEST_PLAYER_SHOP_INFO = 0x1987204e
@@ -355,6 +362,8 @@ def init_db():
             move_speed INTEGER DEFAULT 300,
             attack_speed INTEGER DEFAULT 100,
             critical_damage INTEGER DEFAULT 150,
+            karma INTEGER DEFAULT 1000,
+            crystal INTEGER DEFAULT 0,
             creation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts(id)
         )
@@ -458,6 +467,19 @@ def init_db():
         )
     ''')
     
+    # Stash table (player storage)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stash (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id INTEGER NOT NULL,
+            item_type TEXT NOT NULL,
+            item_id INTEGER NOT NULL,
+            quantity INTEGER DEFAULT 1,
+            slot INTEGER NOT NULL,  -- Stash slot (0-47 for 4 tabs x 12 slots)
+            FOREIGN KEY (character_id) REFERENCES characters(id)
+        )
+    ''')
+    
     # Shop items table (static data)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shop_items (
@@ -472,15 +494,42 @@ def init_db():
     # Insert some default shop items
     cursor.execute("SELECT COUNT(*) FROM shop_items")
     if cursor.fetchone()[0] == 0:
+        # Format: (item_type, item_id, price, currency) - currency is 'karma' or 'crystal'
         shop_data = [
-            ('weapon', 1001, 500), ('weapon', 1002, 1000), ('weapon', 1003, 2000),
-            ('armor', 2001, 400), ('armor', 2002, 800), ('armor', 2003, 1500),
-            ('accessory', 3001, 200), ('accessory', 3002, 400),
-            ('potion_hp', 4001, 50), ('potion_mp', 4002, 50),
+            # Weapons
+            ('weapon', 1001, 500, 'karma'), ('weapon', 1002, 1000, 'karma'), ('weapon', 1003, 2000, 'karma'),
+            # Armor
+            ('armor', 2001, 400, 'karma'), ('armor', 2002, 800, 'karma'), ('armor', 2003, 1500, 'karma'),
+            # Accessories
+            ('accessory', 3001, 200, 'karma'), ('accessory', 3002, 400, 'karma'),
+            # Health/Energy Potions (karma)
+            ('consumable', 20057, 200, 'karma'),   # Small Energy Potion
+            ('consumable', 20058, 250, 'karma'),   # Small Health Potion
+            ('consumable', 20059, 600, 'karma'),   # Medium Energy Potion
+            ('consumable', 20060, 750, 'karma'),   # Medium Health Potion
+            ('consumable', 20061, 1200, 'karma'),  # Large Energy Potion
+            ('consumable', 20062, 1500, 'karma'),  # Large Health Potion
+            # Food - Small stat boosts (5 min) - karma
+            ('consumable', 20000, 150, 'karma'),   # Spicy Sushi - Boost Power
+            ('consumable', 20001, 150, 'karma'),   # Caviar Onigiri - Boost Skill
+            ('consumable', 20002, 150, 'karma'),   # Mint Tofu - Boost Defense
+            ('consumable', 20003, 150, 'karma'),   # Garlic Snapper - Movement Speed
+            ('consumable', 20004, 150, 'karma'),   # Ginseng Soba - Critical Chance
+            # Food - Large stat boosts (10 min) - karma
+            ('consumable', 20009, 300, 'karma'),   # Sea Urchin Sushi - Boost Power
+            ('consumable', 20010, 300, 'karma'),   # Kagami Mochi - Boost Skill
+            ('consumable', 20014, 300, 'karma'),   # Dorayaki - Boost Defense
+            ('consumable', 20015, 300, 'karma'),   # Fugu Tempura - Movement Speed
+            ('consumable', 20016, 300, 'karma'),   # Sukiyaki - Critical Chance
+            # Drinks/Teas (buffs) - karma
+            ('consumable', 20017, 400, 'karma'),   # Shochu - XP Boost
+            ('consumable', 20018, 500, 'karma'),   # Awamori - Loot Quality
+            ('consumable', 20019, 350, 'karma'),   # Hojicha Tea - Energy Regen
+            ('consumable', 20020, 350, 'karma'),   # Chrysanthemum Tea - HP Regen
         ]
-        for item_type, item_id, price in shop_data:
-            cursor.execute("INSERT INTO shop_items (item_type, item_id, price) VALUES (?, ?, ?)", 
-                          (item_type, item_id, price))
+        for item_type, item_id, price, currency in shop_data:
+            cursor.execute("INSERT INTO shop_items (item_type, item_id, price, currency) VALUES (?, ?, ?, ?)", 
+                          (item_type, item_id, price, currency))
     
     conn.commit()
     conn.close()
@@ -556,6 +605,28 @@ def make_game_packet(method_id, body_writer=None):
     
     return framed.get_bytes()
 
+def make_battle_packet(method_id, body_writer=None):
+    """Create a complete battle protocol packet with framing.
+    
+    Battle packets use type=1 instead of type=0 (game logic).
+    """
+    # Build inner payload: [method ID][body]
+    inner = PacketWriter()
+    inner.write_int(method_id)
+    if body_writer:
+        inner_data = body_writer.get_bytes()
+        inner.data.extend(inner_data)
+    
+    inner_bytes = inner.get_bytes()
+    
+    # Frame it: [4 bytes size][2 bytes type=1 (battle)][body]
+    framed = PacketWriter()
+    framed.write_int(len(inner_bytes))
+    framed.write_short(1)  # ePacketBattle
+    framed.data.extend(inner_bytes)
+    
+    return framed.get_bytes()
+
 def make_heartbeat_pong():
     """Create heartbeat pong response."""
     pkt = PacketWriter()
@@ -576,13 +647,34 @@ current_account_id = None
 current_character_id = None
 current_map_name = ""
 
+# Debug configuration - set flags to True to enable debug logging
+DEBUG = {
+    "inventory": False,   # Item swaps, equip/unequip, bag info
+    "scenes": False,      # Scene loading, NPC/monster spawns
+    "packets": False,     # Packet send/receive details
+}
+
+def debug_log(category, message):
+    """Print debug message if category is enabled."""
+    if DEBUG.get(category, False):
+        print(f"[DEBUG {category.upper()}] {message}")
+
+# Track last swap operation per character to prevent duplicate processing
+_last_swap_time = {}  # {character_id: (srcslot, dstslot, timestamp)}
+
+# Scene management instances
+scene_parser = load_scene_data()
+gate_manager = GateManager()
+trigger_manager = TriggerManager()
+
 # Spawn positions for each map (x, y, z)
 # Positions extracted from XML Scene_Objs in akaneiro-client-compiled/assetbundles/XML/SCENE/
 SPAWN_POSITIONS = {
     "Hub_Village": (81.35, 2.05, 84.85),
     "Hub_Village_Tutorial": (51.39, 6.98, 99.23),
     # Area 1 - Shigemori River
-    "A1_M1": (100.0, 2.0, 100.0), "A1_M2": (100.0, 2.0, 100.0),
+    "A1_M1": (100.0, 2.0, 100.0), 
+    "A1_M2": (-12.53, 12.84, 73.49),  # Verified spawn point
     "A1_M3": (100.0, 2.0, 100.0), "A1_M4": (100.0, 2.0, 100.0),
     # Area 2 - Jawbone Ravine
     "A2_M1": (100.0, 2.0, 100.0), "A2_M2": (100.0, 2.0, 100.0),
@@ -605,6 +697,18 @@ SPAWN_POSITIONS = {
     "TWILIGHT": (100.0, 2.0, 100.0),
 }
 DEFAULT_SPAWN = (100.0, 2.0, 100.0)
+
+# Mutable NPC spawn positions for Hub_Village (can be updated via debug commands)
+# Positions verified from in-game observation
+hub_village_npc_spawns = {
+    1001: (83.39, 11.21, 74.43),   # MISSIONPC - Bounty Master
+    1002: (85.78, 11.21, 87.54),   # SHOPNPC - Vendor Gato
+    1003: (91.11, 11.21, 69.92),   # SKILLNPC - Trainer Tadeka
+    1004: (91.34, 11.21, 76.34),   # PETNPC - Summoner Shimizu
+    1005: (79.19, 11.21, 91.56),   # MAILNPC - Elder Shaman Pan
+    1007: (71.08, 11.21, 91.65),   # STEELNPC - Weapons/Armor Vendor
+    1011: (79.38, 11.21, 79.92),   # STASH - Player Stash
+}
 
 def parse_string(data, offset):
     """Parse a length-prefixed UTF-8 string from data at offset. Returns (string, new_offset)."""
@@ -963,6 +1067,7 @@ def handle_user_create_character(nickname, style, sex):
         
         for item_key, item_id in starter_items.items():
             slot = EQUIPMENT_SLOTS[item_key]
+            print(f"Inserting starter item: type={item_key}, id={item_id}, slot={slot}")
             cursor.execute(
                 "INSERT INTO items (character_id, item_type, item_id, quantity, slot) VALUES (?, ?, ?, 1, ?)",
                 (char_id, item_key, item_id, slot)
@@ -1167,21 +1272,38 @@ def handle_user_select_character(character_id):
     return packets
 
 def handle_enter_scene(map_name):
-    """Handle EnterScene and send On_EnterSceneOk."""
+    """Handle EnterScene and send On_EnterSceneOk + breakable actors."""
     global current_map_name
     print(f"EnterScene: map={map_name}")
+    
+    packets = []
     
     try:
         # Store the map name for spawn position lookup
         current_map_name = map_name
         
+        # Load scene data (breakables, triggers, gates)
+        scene_data = scene_parser.get_scene(map_name)
+        if scene_data:
+            print(f"[SCENE] Loaded scene data: {len(scene_data.breakable_actors)} breakables, "
+                  f"{len(scene_data.triggers)} triggers, {len(scene_data.gates)} gates")
+            
+            # Load gates and triggers for current character
+            if current_character_id:
+                gate_manager.load_scene_gates(current_character_id, scene_data)
+                trigger_manager.load_scene_triggers(current_character_id, scene_data)
+        else:
+            print(f"[SCENE] No scene data found for '{map_name}'")
+        
         # Build On_EnterSceneOk response with the same map name
         body = PacketWriter()
         body.write_string(map_name)
-        
-        packet = make_game_packet(ENTER_SCENE_OK, body)
+        packets.append(make_game_packet(ENTER_SCENE_OK, body))
         print(f"Sent EnterSceneOK response for map={map_name}")
-        return packet
+        
+
+        
+        return packets
     except Exception as e:
         print(f"Error handling EnterScene: {e}")
         import traceback
@@ -1190,6 +1312,182 @@ def handle_enter_scene(map_name):
         body = PacketWriter()
         body.write_string(map_name)
         return make_game_packet(ENTER_SCENE_OK, body)
+
+def build_breakable_actor_packet(objectID: int, ActorID: int, 
+                                  pos: tuple, scale: tuple = (1.0, 1.0, 1.0),
+                                  rotation: tuple = (0.0, 0.0, 0.0)) -> bytes:
+    """Build SBreakableActorEnter packet to spawn a breakable actor on client.
+    
+    Uses battle protocol framing (type=1) since BREAKABLE_ACTOR_ENTER is a battle method.
+    """
+    body = PacketWriter()
+    body.write_int(objectID)
+    body.write_int(ActorID)
+    body.write_float(pos[0])  # x
+    body.write_float(pos[1])  # y
+    body.write_float(pos[2])  # z
+    body.write_float(scale[0])  # sx
+    body.write_float(scale[1])  # sy
+    body.write_float(scale[2])  # sz
+    body.write_float(rotation[0])  # rx
+    body.write_float(rotation[1])  # ry
+    body.write_float(rotation[2])  # rz
+    
+    return make_battle_packet(BREAKABLE_ACTOR_ENTER, body)
+
+# Mapping of content names to InteractiveObj TypeIDs (ActorID)
+# These need to match the TypeID values set on prefabs in Unity
+# Format: 'ContentName': type_id
+BREAKABLE_ACTOR_TYPEID_MAP = {
+    # Breakables - extracted from prefab files (TypeID = 0x2e = 46 for BRK_Basket)
+    'BRK_Basket': 46,
+    'BRK_BonePile': 47,  # Sequential
+    'BRK_FragrantPot': 48,
+    'BRK_FruitHead': 49,
+    'BRK_Grave': 50,
+    'BRK_Mushroom': 51,
+    'BRK_PracticeDummy': 52,
+    'BRK_TreeRoot': 53,
+    # Chests - likely start at different base ID
+    'GAM_Chest_Treasure_Sml_A1': 60,
+    'GAM_Chest_Treasure_A1': 61,
+    'GAM_Chest_Treasure_Gold_A1': 62,
+    # Doors/Gates
+    'GAM_Door_Fence': 70,
+    'GAM_Door_OniCamp': 71,
+}
+
+def _get_actor_id_from_content(content_name: str, fallback_index: int) -> int:
+    """Get ActorID (TypeID) for a breakable actor based on its content name.
+    
+    Falls back to sequential ID if no mapping found.
+    """
+    # Try exact match first
+    if content_name in BREAKABLE_ACTOR_TYPEID_MAP:
+        return BREAKABLE_ACTOR_TYPEID_MAP[content_name]
+    
+    # Try prefix matching (e.g., 'CH_Wolf_Insane' -> look for 'Wolf')
+    for pattern, type_id in BREAKABLE_ACTOR_TYPEID_MAP.items():
+        if pattern.split('_')[0] == content_name.split('_')[0]:
+            return type_id
+    
+    # Fallback to sequential ID based on index
+    return 100 + fallback_index
+
+def send_breakable_actors(conn, character_id: int, map_name: str):
+    """Send breakable actor spawn packets for current scene."""
+    if not current_character_id:
+        return
+    
+    scene_data = scene_parser.get_scene(map_name)
+    if not scene_data or not scene_data.breakable_actors:
+        print(f"[SCENE] No breakable actors to send for '{map_name}'")
+        return
+    
+    # Send each breakable actor
+    for i, actor in enumerate(scene_data.breakable_actors):
+        # Generate unique objectID (1000 + index)
+        object_id = 1000 + i
+        
+        # Get ActorID from content name using mapping or fallback
+        actor_id = _get_actor_id_from_content(actor.content, i)
+        
+        packet = build_breakable_actor_packet(
+            objectID=object_id,
+            ActorID=actor_id,
+            pos=actor.position,
+            scale=actor.scale,
+            rotation=actor.rotation
+        )
+        
+        conn.sendall(packet)
+        print(f"[SCENE] Sent breakable actor {i}: '{actor.content}' (ActorID={actor_id}) at {actor.position}")
+
+# Predefined offsets for distributing breakable actors around a spawn point
+# These create a natural-looking cluster pattern
+_BREAKABLE_OFFSETS = [
+    # Center cluster (chests, baskets near spawn)
+    (0.0, 0.0, 3.0),      # basket center-front
+    (2.5, 0.0, 1.5),      # chest right-front
+    (-2.5, 0.0, 1.5),     # chest left-front
+    (0.0, 0.0, -3.0),     # basket center-back
+    (4.0, 0.0, 0.0),      # chest far right
+    (-4.0, 0.0, 0.0),     # chest far left
+    # Enemy spawn positions (slightly further out)
+    (8.0, 0.0, 5.0),      # wolf 1
+    (-8.0, 0.0, 5.0),     # wolf 2
+    (8.0, 0.0, -5.0),     # imp 1
+    (-8.0, 0.0, -5.0),    # imp 2
+    (0.0, 0.0, 10.0),     # wolf alpha back
+    (12.0, 0.0, 0.0),     # imp patrol right
+    (-12.0, 0.0, 0.0),    # imp patrol left
+    (0.0, 0.0, -12.0),    # boss back
+    (6.0, 0.0, 8.0),      # enemy flank right
+]
+
+def _get_breakable_position(actor_index: int, spawn_pos: tuple) -> tuple:
+    """Calculate breakable actor position based on index and spawn point.
+    
+    Uses predefined offsets to create a natural cluster around the spawn point.
+    Falls back to (0,0,0) if no offset is defined for this index.
+    """
+    # Use Y from spawn position (height), apply X/Z offsets
+    base_x, base_y, base_z = spawn_pos
+    
+    if actor_index < len(_BREAKABLE_OFFSETS):
+        ox, oy, oz = _BREAKABLE_OFFSETS[actor_index]
+        return (base_x + ox, base_y + oy, base_z + oz)
+    else:
+        # Fallback: spiral outward for extra actors
+        angle = actor_index * 0.5  # ~28 degrees apart
+        radius = 15.0 + (actor_index - len(_BREAKABLE_OFFSETS)) * 3.0
+        x = base_x + radius * angle  # Simple spiral
+        z = base_z + radius * (angle ** 0.5)
+        return (x, base_y, z)
+
+def build_breakable_actors_packet_list(character_id: int, map_name: str) -> list:
+    """Build a list of SBreakableActorEnter packets for current scene.
+    
+    Returns empty list if no breakable actors or scene data unavailable.
+    Uses spawn position from SPAWN_POSITIONS to distribute breakables naturally.
+    """
+    import math
+    if not character_id:
+        return []
+    
+    scene_data = scene_parser.get_scene(map_name)
+    if not scene_data or not scene_data.breakable_actors:
+        print(f"[SCENE] No breakable actors to send for '{map_name}'")
+        return []
+    
+    # Get spawn position for this map
+    spawn_pos = SPAWN_POSITIONS.get(map_name, DEFAULT_SPAWN)
+    print(f"[SCENE] Building {len(scene_data.breakable_actors)} breakable actors for '{map_name}' at spawn {spawn_pos}")
+    
+    packets = []
+    # Build each breakable actor packet with distributed positions
+    for i, actor in enumerate(scene_data.breakable_actors):
+        # Generate unique objectID (1000 + index)
+        object_id = 1000 + i
+        
+        # Get ActorID from content name using mapping or fallback
+        actor_id = _get_actor_id_from_content(actor.content, i)
+        
+        # Calculate position - use predefined offsets around spawn point
+        pos = _get_breakable_position(i, spawn_pos)
+        
+        packet = build_breakable_actor_packet(
+            objectID=object_id,
+            ActorID=actor_id,
+            pos=pos,
+            scale=actor.scale,
+            rotation=actor.rotation
+        )
+        
+        packets.append(packet)
+        print(f"[SCENE] Built breakable actor {i}: '{actor.content}' (ActorID={actor_id}, objectID={object_id}) at {pos} | packet size={len(packet)}")
+    
+    return packets
 
 # Equipment slot mapping: database slot -> client equipment index
 # Client uses: 0=helm, 1=necklace, 2=chest, 3=cloak, 4=ring, 6/7=weapons, 8=legs
@@ -1201,8 +1499,8 @@ def build_bag_info():
     """Build SBagGroup response with character's items.
     
     Returns a SEND_BAG_INFO packet or None if no items found.
-    Equipped items go in BOTH equipbag (for model rebuild) and basebag (for inventory).
-    Unequipped items only go in basebag.
+    Equipped items go in equipbag (for model rebuild).
+    Unequipped items only go in basebag (inventory).
     """
     body = PacketWriter()
     
@@ -1252,14 +1550,21 @@ def build_bag_info():
         all_items = cursor.fetchall()
         conn.close()
         
-        print(f"Building bag info for char {char_id}: {len(all_items)} items")
+        debug_log("inventory", f"Building bag info for char {char_id}: {len(all_items)} items")
         
-        # Separate equipped vs unequipped items
-        # Equipped items have slot 0-8 (equipment slots), unequipped have slot >= 100
-        equipped_items = [item for item in all_items if item[4] < 100]
+        # Debug: Show all items with their slots
+        for i, item in enumerate(all_items):
+            debug_log("inventory", f"  Item {i}: db_id={item[0]}, type={item[1]}, id={item[2]}, slot={item[4]}")
+        
+        # Separate equipped vs inventory items
+        # Equipped items have slot 0-8 (equipment slots)
+        # Inventory items have slot 100+ (basebag slots - using 100-119 for 20 slots)
+        equipped_items = [item for item in all_items if item[4] < 9]
         unequipped_items = [item for item in all_items if item[4] >= 100]
         
-        print(f"  Equipped: {len(equipped_items)}, Unequipped: {len(unequipped_items)}")
+        debug_log("inventory", f"Filtered - Equipped: {len(equipped_items)}, Unequipped: {len(unequipped_items)}")
+        
+        debug_log("inventory", f"  Equipped: {len(equipped_items)}, Unequipped (in inventory): {len(unequipped_items)}")
         
         # equipbag (bagID=0): Send equipped items so InitPlayerModelEquips() can rebuild model
         body.write_byte(0)
@@ -1270,13 +1575,16 @@ def build_bag_info():
             # item[4] is already the client equipment slot index (from EQUIPMENT_SLOTS)
             write_item(item[2], db_id=item[0], slot=item[4], count=item[3])
         
-        # basebag (bagID=1): main inventory - send ALL items here
+        # basebag (bagID=1): main inventory - send ONLY unequipped items here
         body.write_byte(1)
         body.write_uint(20)  # inventory capacity
         body.write_bool(False)
-        body.write_int(len(all_items))
-        for idx, item in enumerate(all_items):
-            write_item(item[2], db_id=item[0], slot=idx, count=item[3])
+        # Sort by slot so client receives items in position order
+        sorted_unequipped = sorted(unequipped_items, key=lambda x: x[4])
+        body.write_int(len(sorted_unequipped))
+        for item in sorted_unequipped:
+            # Use actual DB slot - 100 as the slot value (matches client's inventory positions)
+            write_item(item[2], db_id=item[0], slot=item[4] - 100, count=item[3])
     except Exception as e:
         print(f"Error building bag info: {e}")
         import traceback
@@ -1335,11 +1643,11 @@ def handle_map_load_ok():
         packets.append(packet)
         print(f"Sent CharacterStartInfo, size={len(packet)}")
         
-        # Send money info (karma/FK) to client
+        # Send money info (karma/FK) to client - karma is now per-character
         try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT karma FROM accounts WHERE id = ?", (current_account_id,))
+            db_conn = sqlite3.connect(DB_PATH)
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT karma FROM characters WHERE id = ?", (current_character_id,))
             row = cursor.fetchone()
             karma = row[0] if row else 1000
             fk = 0  # FK not implemented yet
@@ -1348,7 +1656,7 @@ def handle_map_load_ok():
             cursor.execute("SELECT exp FROM characters WHERE id = ?", (current_character_id,))
             char_row = cursor.fetchone()
             xp = char_row[0] if char_row else 0
-            conn.close()
+            db_conn.close()
         except:
             karma = 1000
             fk = 0
@@ -1373,18 +1681,20 @@ def handle_map_load_ok():
             packets.append(bag_info)
             print("Sent bag info proactively")
         
+
+        
         # Spawn NPCs and monsters based on map
         if current_map_name == "Hub_Village_Tutorial":
-            # Spawn tutorial NPC (MISSIONPC type = 1001) near spawn point
-            # Bounty Master should be close to player but slightly offset to guide them
+            # Spawn tutorial NPC (MISSIONPC type = 1001) at official position from XML Scene_Objs
+            # Position: (63.77, 2.36, 92.30) - Hub_Village_Tutorial_Sound location in XML
             npc_body = PacketWriter()
             npc_body.write_int(2001)      # objectID for NPC
             npc_body.write_int(1001)      # npcID = MISSIONPC (Bounty Master)
-            npc_body.write_float(spawn[0] + 5.0)   # x (slightly right of player)
-            npc_body.write_float(spawn[1])         # y
-            npc_body.write_float(spawn[2] - 3.0)   # z (slightly in front of player)
+            npc_body.write_float(63.77)   # x from XML Scene_Objs
+            npc_body.write_float(2.36)    # y from XML Scene_Objs (already pointOnTheGround adjusted)
+            npc_body.write_float(92.30)   # z from XML Scene_Objs
             packets.append(make_game_packet(NPC_ENTER, npc_body))
-            print("Spawned tutorial NPC (Bounty Master)")
+            print("Spawned tutorial NPC (Bounty Master) at official position")
             
             # Spawn wolf monster automatically when entering tutorial map
             # Position based on user-provided coordinates: (60.18, 7.81, 84.71)
@@ -1401,26 +1711,17 @@ def handle_map_load_ok():
             print("Spawned tutorial wolf monster")
         
         elif current_map_name == "Hub_Village":
-            # Spawn village NPCs: Mission NPC, Shop NPC, Mail NPC, Day Reward NPC
-            # Positions based on typical hub village layout - vendors spread around the central area
-            npc_positions = [
-                (1001, spawn[0] + 15.0, spawn[2] + 10.0),   # MISSIONPC - center-right
-                (1002, spawn[0] - 15.0, spawn[2] + 10.0),   # SHOPNPC - center-left
-                (1003, spawn[0] + 10.0, spawn[2] - 10.0),   # SHOPNPC2 - south-right
-                (1004, spawn[0] - 10.0, spawn[2] - 10.0),   # SHOPNPC3 - south-left
-                (1005, spawn[0], spawn[2] + 20.0),          # MAILNPC - north center
-                (1006, spawn[0] + 25.0, spawn[2]),          # DAYREWARDNPC - east
-            ]
-            
-            for i, (npc_id, x, z) in enumerate(npc_positions):
+            # Spawn village NPCs at positions from hub_village_npc_spawns dict
+            # These can be updated via debug commands (!npc <id> <x> <y> <z>)
+            for npc_id, (x, y, z) in hub_village_npc_spawns.items():
                 npc_body = PacketWriter()
-                npc_body.write_int(2001 + i)    # unique objectID for each NPC
-                npc_body.write_int(npc_id)      # npcID
+                npc_body.write_int(2001 + list(hub_village_npc_spawns.keys()).index(npc_id))  # unique objectID
+                npc_body.write_int(npc_id)
                 npc_body.write_float(x)
-                npc_body.write_float(spawn[1])
+                npc_body.write_float(y)  # Use official Y (already adjusted by pointOnTheGround)
                 npc_body.write_float(z)
                 packets.append(make_game_packet(NPC_ENTER, npc_body))
-            print(f"Spawned {len(npc_positions)} village NPCs")
+            print(f"Spawned {len(hub_village_npc_spawns)} village NPCs at verified positions")
         
     except Exception as e:
         print(f"Error building CharacterStartInfo: {e}")
@@ -1447,37 +1748,36 @@ def handle_accept_mission(npc_id, mission_id):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
+            # Check if mission already exists
             cursor.execute(
-                "INSERT INTO missions (character_id, mission_id, status) VALUES (?, ?, 'active')",
+                "SELECT id FROM missions WHERE character_id = ? AND mission_id = ?",
                 (current_character_id, mission_id)
             )
-            conn.commit()
+            existing = cursor.fetchone()
+            
+            if not existing:
+                cursor.execute(
+                    "INSERT INTO missions (character_id, mission_id, status) VALUES (?, ?, 'active')",
+                    (current_character_id, mission_id)
+                )
+                conn.commit()
+                print(f"Mission {mission_id} added for character {current_character_id}")
+            else:
+                print(f"Mission {mission_id} already exists for character {current_character_id}")
         except Exception as e:
             print(f"Error storing mission: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             conn.close()
+    else:
+        print(f"ERROR: current_character_id is None when accepting mission!")
     
-    # Send AcceptMissionOk
+    # Send AcceptMissionOk only - MISSION_LIST_ACK will be sent when client requests it
     body = PacketWriter()
     body.write_int(1)  # returnCode=1 (success)
     response = make_game_packet(ACCEPT_MISSION_OK, body)
-    
-    # Also send MISSION_LIST_ACK with the newly accepted mission
-    list_body = PacketWriter()
-    list_body.write_int(1)  # count of missions
-    
-    # Build SAcceptMissionRelate for mission 5011
-    list_body.write_int(mission_id)           # missionID
-    list_body.write_int(0)                    # IsHaveCompleted (0=no)
-    list_body.write_bool(True)                # IsHaveTriggered (true - mission is active)
-    list_body.write_int(1)                    # star rating
-    list_body.write_int(0)                    # lastPassTime
-    list_body.write_int(2)                    # canAcceptMaxLvl
-    
-    list_response = make_game_packet(MISSION_LIST_ACK, list_body)
-    
-    # Send both responses
-    return [response, list_response]
+    return response
 
 def handle_ping_request():
     """Handle PingRequest and send PingRequestAck."""
@@ -1604,30 +1904,135 @@ def handle_buy_char_slot_request():
     response = make_game_packet(BUY_CHAR_SLOT_RESULT, body)
     return response
 
-def handle_buy_consume_item(item_id, quantity):
-    """Handle BuyConsumeItem - buy consumable items."""
-    print(f"BuyConsumeItem: item={item_id}, qty={quantity}")
+def handle_buy_consume_item(consume_type, item_id, quantity):
+    """Handle BuyConsumeItem - buy consumable items from shop.
     
-    # Add item to inventory (mock)
-    if current_character_id:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        try:
+    Args:
+        consume_type: Consumable type identifier (e.g., potion type)
+        item_id: Item template ID (e.g., 4001 for HP potion)
+        quantity: Number of items to buy
+    
+    Returns:
+        Success or failure packet
+    """
+    print(f"[BUY] ENTERING handler: type={consume_type}, item={item_id}, qty={quantity}")
+    debug_log("inventory", f"handle_buy_consume_item: type={consume_type}, item={item_id}, qty={quantity}")
+    packets = []
+    
+    if not current_character_id:
+        fail_body = PacketWriter()
+        fail_body.write_int(1)  # eUnknownError
+        return [make_game_packet(BUY_ITEM_FAILED, fail_body)]
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        print(f"[BUY] DB connect OK, looking up item {item_id}...")
+        debug_log("inventory", f"Looking up item {item_id} in shop...")
+        # Look up item in shop (get currency type too)
+        cursor.execute(
+            "SELECT item_type, price, currency FROM shop_items WHERE item_id = ?",
+            (item_id,)
+        )
+        shop_item = cursor.fetchone()
+        print(f"[BUY] Shop lookup result: {shop_item}")
+        debug_log("inventory", f"Shop lookup result: {shop_item}")
+        
+        if not shop_item:
+            debug_log("inventory", f"ERROR: Item {item_id} not found in shop")
+            fail_body = PacketWriter()
+            fail_body.write_int(1)  # eUnknownError
+            return [make_game_packet(BUY_ITEM_FAILED, fail_body)]
+        
+        item_type, unit_price, currency = shop_item
+        total_price = unit_price * quantity
+        debug_log("inventory", f"Item {item_id} ({item_type}): {unit_price} each, total={total_price}, currency={currency}")
+        
+        # Check balance based on currency type
+        if currency == 'crystal':
             cursor.execute(
-                "INSERT INTO items (character_id, item_type, item_id, quantity) VALUES (?, 'consumable', ?, ?)",
-                (current_character_id, item_id, quantity)
+                "SELECT crystal FROM characters WHERE id = ?",
+                (current_character_id,)
             )
-            conn.commit()
-        except Exception as e:
-            print(f"Error adding consumable item: {e}")
-        finally:
-            conn.close()
+        else:  # default to karma
+            cursor.execute(
+                "SELECT karma FROM characters WHERE id = ?",
+                (current_character_id,)
+            )
+        row = cursor.fetchone()
+        current_balance = row[0] if row else (1000 if currency == 'karma' else 0)
+        
+        if current_balance < total_price:
+            debug_log("inventory", f"ERROR: Not enough {currency}. Have {current_balance}, need {total_price}")
+            fail_body = PacketWriter()
+            fail_body.write_int(2)  # eInvalidParameter (not enough money)
+            return [make_game_packet(BUY_ITEM_FAILED, fail_body)]
+        
+        # Find next available inventory slot
+        cursor.execute(
+            "SELECT MAX(slot) FROM items WHERE character_id = ? AND slot >= 100",
+            (current_character_id,)
+        )
+        max_slot = cursor.fetchone()[0]
+        next_slot = (max_slot if max_slot else 99) + 1
+        
+        # Deduct correct currency and add item
+        if currency == 'crystal':
+            cursor.execute(
+                "UPDATE characters SET crystal = crystal - ? WHERE id = ?",
+                (total_price, current_character_id)
+            )
+        else:  # default to karma
+            cursor.execute(
+                "UPDATE characters SET karma = karma - ? WHERE id = ?",
+                (total_price, current_character_id)
+            )
+        cursor.execute(
+            "INSERT INTO items (character_id, item_type, item_id, quantity, slot) VALUES (?, ?, ?, ?, ?)",
+            (current_character_id, item_type, item_id, quantity, next_slot)
+        )
+        conn.commit()
+        
+        debug_log("inventory", f"Bought {quantity}x item {item_id} for {total_price} karma. Slot={next_slot}")
+        
+        # Send success with item details (echo back what was bought)
+        body = PacketWriter()
+        body.write_int(consume_type)  # itemType (numeric type from client)
+        body.write_int(item_id)       # itemID
+        body.write_int(quantity)      # buycount
+        packets.append(make_game_packet(BUY_CONSUME_ITEM_SUCC_ACK, body))
+        
+        # Update money info (both karma and crystal)
+        cursor.execute(
+            "SELECT karma, crystal FROM characters WHERE id = ?",
+            (current_character_id,)
+        )
+        row = cursor.fetchone()
+        new_karma = row[0] if row else 1000
+        new_crystal = row[1] if row else 0
+        
+        money_body = PacketWriter()
+        money_body.write_int(new_karma)   # Karma
+        money_body.write_int(new_crystal)  # FK/Shards (crystals)
+        packets.append(make_game_packet(UPDATE_MONEY_INFO, money_body))
+        debug_log("inventory", f"Sent UPDATE_MONEY_INFO: karma={new_karma}, crystal={new_crystal}")
+        
+        # Send bag info update
+        bag_info = build_bag_info()
+        if bag_info:
+            packets.append(bag_info)
+            debug_log("inventory", f"Sent {len(packets)} packet(s) to client")
+    except Exception as e:
+        print(f"Error buying item: {e}")
+        import traceback
+        traceback.print_exc()
+        fail_body = PacketWriter()
+        fail_body.write_int(1)  # eUnknownError
+        return [make_game_packet(BUY_ITEM_FAILED, fail_body)]
+    finally:
+        conn.close()
     
-    body = PacketWriter()
-    body.write_int(0)  # success code
-    
-    response = make_game_packet(BUY_CONSUME_ITEM_SUCC_ACK, body)
-    return response
+    return packets
 
 def handle_buy_item(item_id):
     """Handle BuyItem - buy equipment items."""
@@ -1653,6 +2058,119 @@ def handle_buy_item(item_id):
     
     response = make_game_packet(BUY_ITEM_SUCC_ACK, body)
     return response
+
+def handle_sell_item(bag_id, slot):
+    """Handle SellItem - sell an item from inventory.
+    
+    Args:
+        bag_id: Bag ID (2 = inventory)
+        slot: Inventory slot (0-based array index)
+    
+    Returns:
+        List of packets to send (empty on success, SaleItemFailed on error)
+    """
+    debug_log("inventory", f"SellItem: bagID={bag_id}, slot={slot}")
+    packets = []
+    
+    if not current_character_id:
+        # Send SaleItemFailed
+        fail_body = PacketWriter()
+        fail_body.write_int(1)  # EServerErrorType::eUnknownError
+        response = make_game_packet(SALE_ITEM_FAILED, fail_body)
+        return [response]
+    
+    if current_character_id:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            # Map client slot to DB slot
+            db_slot = 100 + slot if bag_id == 2 else slot
+            
+            # Check if item exists at this slot
+            cursor.execute(
+                "SELECT id, item_type, item_id, quantity FROM items WHERE character_id = ? AND slot = ?",
+                (current_character_id, db_slot)
+            )
+            item = cursor.fetchone()
+            
+            if not item:
+                debug_log("inventory", f"ERROR: No item at bagID={bag_id}, slot={slot}")
+                # Send SaleItemFailed
+                fail_body = PacketWriter()
+                fail_body.write_int(1)  # EServerErrorType::eUnknownError
+                response = make_game_packet(SALE_ITEM_FAILED, fail_body)
+                return [response]
+            
+            item_db_id, item_type, db_item_id, quantity = item
+            
+            # Items must be in inventory (slot >= 100) to be sold
+            if db_slot < 100:
+                debug_log("inventory", f"ERROR: Item {item_db_id} is equipped (slot={db_slot}), cannot sell")
+                fail_body = PacketWriter()
+                fail_body.write_int(2)  # EServerErrorType::eInvalidParameter
+                response = make_game_packet(SALE_ITEM_FAILED, fail_body)
+                return [response]
+            
+            # Calculate sell price matching client formula:
+            # client: (level) * (1 + eleVal + encVal + gemVal) * (itemVal * 0.4)
+            # For basic items (level=1, no elements/enchants/gems): itemVal * 0.4
+            from item_parser import get_item_parser
+            parser = get_item_parser()
+            sell_price = parser.calculate_sell_price(db_item_id)
+            debug_log("inventory", f"Selling for {sell_price} karma")
+            
+            # Update character karma (per-character now)
+            cursor.execute(
+                "UPDATE characters SET karma = karma + ? WHERE id = ?",
+                (sell_price, current_character_id)
+            )
+            
+            # Delete the item from database
+            cursor.execute(
+                "DELETE FROM items WHERE character_id = ? AND slot = ?",
+                (current_character_id, db_slot)
+            )
+            conn.commit()
+            debug_log("inventory", f"Item {item_db_id} sold for {sell_price} karma")
+            
+            # Explicitly notify client to destroy the item at this slot
+            # This prevents ghost items in the UI
+            destroy_packet = build_notify_item_destroy(bag_id, db_slot - 100 if bag_id == 2 else db_slot)
+            packets.append(destroy_packet)
+            debug_log("inventory", f"Sent NotifyItemDestroy for sold item")
+            
+            # Send updated money info so karma display refreshes in UI
+            try:
+                cursor.execute(
+                    "SELECT karma FROM characters WHERE id = ?",
+                    (current_character_id,)
+                )
+                row = cursor.fetchone()
+                current_karma = row[0] if row else 1000
+                
+                money_body = PacketWriter()
+                money_body.write_int(current_karma)   # Karma
+                money_body.write_int(0)               # FK
+                packets.append(make_game_packet(UPDATE_MONEY_INFO, money_body))
+                debug_log("inventory", f"Sent UPDATE_MONEY_INFO: karma={current_karma}")
+            except Exception as e:
+                print(f"Error sending money info update: {e}")
+            
+            # Send bag info update so client refreshes inventory UI
+            bag_info = build_bag_info()
+            if bag_info:
+                packets.append(bag_info)
+                debug_log("inventory", f"Sent {len(packets)} packet(s) to client")
+            else:
+                print(f"[SELL] Warning: No bag info sent after sale")
+        except Exception as e:
+            print(f"Error selling item: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            conn.close()
+    
+    return packets
 
 def handle_buy_pet(pet_id):
     """Handle BuyPet - buy a pet."""
@@ -1726,12 +2244,155 @@ def handle_change_name_req(name):
     response = make_game_packet(CHANGE_NAME_RESULT, body)
     return response
 
-def handle_chat_request(channel, message):
-    """Handle ChatRequest."""
-    print(f"ChatRequest: channel={channel}, msg={message}")
-    
+# Debug command prefix
+DEBUG_PREFIX = '!'
+
+# Track NPC object IDs for repositioning
+npc_object_ids = {}  # npc_id -> object_id mapping
+
+def send_chat_response(conn, chat_type, sender_id, sender_name, chat_msg):
+    """Send a CHAT_RESPONSE packet to display a message in-game."""
     body = PacketWriter()
-    body.write_int(0)  # success code
+    body.write_int(chat_type)      # EChatType (2 = System)
+    body.write_int(sender_id)       # sender ID
+    body.write_string(sender_name)  # sender name
+    body.write_string(chat_msg)     # message text
+    return make_game_packet(CHAT_RESPONSE, body)
+
+def execute_debug_command(message, chat_type, target_id, item_id, conn, addr):
+    """Execute a debug command from chat. Returns response packet or None."""
+    parts = message.split()
+    cmd = parts[0].lower()
+    
+    if cmd == '!npc':
+        # !npc <id> <x> <y> <z>
+        if len(parts) >= 5:
+            try:
+                npc_id = int(parts[1])
+                x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+                print(f"DEBUG: Repositioning NPC {npc_id} to ({x}, {y}, {z})")
+                
+                if npc_id in hub_village_npc_spawns:
+                    # Update the position in shared dict
+                    hub_village_npc_spawns[npc_id] = (x, y, z)
+                    print(f"DEBUG: Updated NPC {npc_id} position to ({x}, {y}, {z})")
+                    
+                    # Send NPC_ENTER packet to reposition immediately
+                    npc_body = PacketWriter()
+                    object_id = 2001 + list(hub_village_npc_spawns.keys()).index(npc_id)
+                    npc_object_ids[npc_id] = object_id
+                    npc_body.write_int(object_id)
+                    npc_body.write_int(npc_id)
+                    npc_body.write_float(x)
+                    npc_body.write_float(y)
+                    npc_body.write_float(z)
+                    conn.sendall(make_game_packet(NPC_ENTER, npc_body))
+                    
+                    # Send confirmation via chat
+                    return send_chat_response(conn, 2, 0, "Debug", f"NPC {npc_id} moved to ({x}, {y}, {z})")
+                else:
+                    print(f"DEBUG: Unknown NPC ID {npc_id}")
+                    return send_chat_response(conn, 2, 0, "Debug", f"Unknown NPC ID {npc_id}. Valid IDs: {list(hub_village_npc_spawns.keys())}")
+            except ValueError as e:
+                print(f"DEBUG: Invalid NPC command format: {e}")
+                return send_chat_response(conn, 2, 0, "Debug", f"Invalid format: !npc <id> <x> <y> <z>")
+        else:
+            return send_chat_response(conn, 2, 0, "Debug", "Usage: !npc <id> <x> <y> <z>")
+    
+    elif cmd == '!help':
+        help_text = "Debug commands: !npc <id> <x> <y> <z>, !spawn <type>, !tp <x> <y> <z>, !items, !showmethemoney"
+        print(f"DEBUG: Help requested")
+        return send_chat_response(conn, 2, 0, "Debug", help_text)
+    
+    elif cmd == '!showmethemoney':
+        # !showmethemoney - adds 10000 karma and 10000 shards to character
+        print(f"DEBUG: ShowMeTheMoney requested")
+        if not current_character_id:
+            return send_chat_response(conn, 2, 0, "Debug", "Error: No character selected")
+        
+        try:
+            db_conn = sqlite3.connect(DB_PATH)
+            cursor = db_conn.cursor()
+            
+            # Add karma and shards (crystal)
+            cursor.execute(
+                "UPDATE characters SET karma = karma + 10000, crystal = crystal + 10000 WHERE id = ?",
+                (current_character_id,)
+            )
+            db_conn.commit()
+            
+            # Get updated values
+            cursor.execute(
+                "SELECT karma, crystal FROM characters WHERE id = ?",
+                (current_character_id,)
+            )
+            row = cursor.fetchone()
+            new_karma = row[0] if row else 10000
+            new_crystal = row[1] if row else 10000
+            db_conn.close()
+            
+            print(f"DEBUG: Added 10000 karma + 10000 shards. New values: karma={new_karma}, crystal={new_crystal}")
+            
+            # Send updated money info to client
+            money_body = PacketWriter()
+            money_body.write_int(new_karma)   # Karma
+            money_body.write_int(new_crystal)  # FK/Shards
+            response = make_game_packet(UPDATE_MONEY_INFO, money_body)
+            conn.sendall(response)
+            
+            return send_chat_response(conn, 2, 0, "Debug", f"+10000 karma, +10000 shards! (karma={new_karma}, shards={new_crystal})")
+        except Exception as e:
+            print(f"DEBUG: Error in !showmethemoney: {e}")
+            import traceback
+            traceback.print_exc()
+            return send_chat_response(conn, 2, 0, "Debug", f"Error: {e}")
+    
+    elif cmd == '!spawn':
+        # !spawn <type> [x] [y] [z]
+        if len(parts) >= 2:
+            spawn_type = parts[1].lower()
+            x = float(parts[2]) if len(parts) > 2 else 0.0
+            y = float(parts[3]) if len(parts) > 3 else 0.0
+            z = float(parts[4]) if len(parts) > 4 else 0.0
+            print(f"DEBUG: Spawn {spawn_type} at ({x}, {y}, {z})")
+            return send_chat_response(conn, 2, 0, "Debug", f"Spawned {spawn_type}")
+        else:
+            return send_chat_response(conn, 2, 0, "Debug", "Usage: !spawn <type> [x] [y] [z]")
+    
+    elif cmd == '!tp':
+        # !tp <x> <y> <z>
+        if len(parts) >= 4:
+            try:
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                print(f"DEBUG: Teleport to ({x}, {y}, {z})")
+                return send_chat_response(conn, 2, 0, "Debug", f"TP to ({x}, {y}, {z})")
+            except ValueError:
+                pass
+        return send_chat_response(conn, 2, 0, "Debug", "Usage: !tp <x> <y> <z>")
+    
+    elif cmd == '!items':
+        print(f"DEBUG: Debug items requested")
+        return send_chat_response(conn, 2, 0, "Debug", "Debug items: feature not implemented")
+    
+    return None  # Not a debug command
+
+def handle_chat_request(chat_type, target_id, item_id, message, conn=None, addr=None):
+    """Handle ChatRequest with debug command support."""
+    print(f"ChatRequest: type={chat_type}, target={target_id}, item={item_id}, msg='{message}'")
+    
+    # Check for debug commands (prefix with !)
+    if message.startswith(DEBUG_PREFIX):
+        response = execute_debug_command(message, chat_type, target_id, item_id, conn, addr)
+        return response
+    
+    # Normal chat - send CHAT_REQUEST_ACK with proper format
+    # Format: [chatType(4)][targetID(4)][itemID(4)][chatMsg(string)][returnCode(4)]
+    body = PacketWriter()
+    body.write_int(chat_type)
+    body.write_int(target_id)
+    body.write_int(item_id)
+    body.write_string(message)
+    body.write_int(0)  # eReturncode (0=success)
     
     response = make_game_packet(CHAT_REQUEST_ACK, body)
     return response
@@ -1747,24 +2408,57 @@ def handle_crafting_item(recipe_id):
     return response
 
 def handle_del_item(item_uuid):
-    """Handle DelItem."""
-    print(f"DelItem: uuid={item_uuid}")
+    """Handle DelItem - delete/sell an item from inventory.
+    
+    Args:
+        item_uuid: Database ID of the item to delete
+    """
+    print(f"DelItem/SellItem: uuid={item_uuid}")
+    packets = []
     
     if current_character_id:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
+            # Check if item exists and get its slot
+            cursor.execute(
+                "SELECT id, item_type, item_id, quantity, slot FROM items WHERE character_id = ? AND id = ?",
+                (current_character_id, item_uuid)
+            )
+            item = cursor.fetchone()
+            
+            if not item:
+                print(f"ERROR: Item {item_uuid} not found")
+                return packets
+            
+            item_db_id, item_type, db_item_id, quantity, slot = item
+            print(f"Deleting item {item_db_id} ({item_type}, id={db_item_id}), slot={slot}")
+            
+            # Items must be in inventory (slot >= 100) to be deleted/sold
+            if slot < 100:
+                print(f"ERROR: Item {item_db_id} is equipped (slot={slot}), cannot delete")
+                return packets
+            
+            # Delete the item from database
             cursor.execute(
                 "DELETE FROM items WHERE character_id = ? AND id = ?",
                 (current_character_id, item_uuid)
             )
             conn.commit()
+            print(f"Item {item_db_id} deleted/sold")
+            
+            # Send bag info update
+            bag_info = build_bag_info()
+            if bag_info:
+                packets.append(bag_info)
         except Exception as e:
             print(f"Error deleting item: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             conn.close()
     
-    # No response needed for DelItem
+    return packets
     
 def handle_delete_mail(mail_id):
     """Handle DeleteMail."""
@@ -1819,75 +2513,163 @@ CLIENT_PART_TO_ITEM_TYPES = {
     8: ['breeches'],       # Slot 8 - Legs/Breeches (client index 8 = legs, NOT cloak!)
 }
 
+# Inventory uses slots 1-20 for basebag, 0-8 for equipment
+# Equipment slots: 0=helm, 1=necklace, 2=chest, 3=cloak, 4=ring, 6/7=weapons, 8=legs
+# Inventory slots: 1-20 (can hold items independently)
+
+def get_next_inventory_slot():
+    """Get next available inventory slot number (100-119 for 20 slots)."""
+    # Find first empty slot in 100-119 range
+    if current_character_id:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        try:
+            # Debug: show what's currently in inventory slots
+            cursor.execute(
+                "SELECT id, item_type, slot FROM items WHERE character_id = ? AND slot >= 100 ORDER BY slot",
+                (current_character_id,)
+            )
+            existing = cursor.fetchall()
+            debug_log("inventory", f"get_next_inventory_slot: char={current_character_id}, existing inv items: {[(i[0], i[1], i[2]) for i in existing]}")
+            
+            for slot_num in range(100, 120):
+                cursor.execute(
+                    "SELECT id FROM items WHERE character_id = ? AND slot = ?",
+                    (current_character_id, slot_num)
+                )
+                if not cursor.fetchone():
+                    debug_log("inventory", f"get_next_inventory_slot: returning {slot_num}")
+                    conn.close()
+                    return slot_num
+            conn.close()
+        except Exception as e:
+            debug_log("inventory", f"get_next_inventory_slot error: {e}")
+    # Fallback to 100 if all slots are full
+    debug_log("inventory", "get_next_inventory_slot: fallback to 100")
+    return 100
+
 def handle_equip_item(part, bag_id, slot):
     """Handle EquipItem - equip item to character.
     
-    In Akaneiro, equipped items STAY in inventory but are marked as equipped.
-    The client tracks what's equipped separately from the inventory list.
-    We do NOT change the item's database slot when equipping.
+    When equipping, the item is MOVED from inventory (slot 100-119) to equipment slot (0-8).
+    This ensures items can't exist in both places at once.
     
     Args:
         part: Equipment slot index (0-8 for various slots)
         bag_id: Source bag ID (2 = inventory/basebag)
-        slot: Slot number in source bag (inventory position 0,1,2,3...)
+        slot: Inventory slot number from client (1-20, maps to 100-119 in DB)
     
     Returns:
         List of packets to send back to client
     """
-    print(f"EquipItem: part={part}, bagID={bag_id}, slot={slot}")
+    debug_log("inventory", f"EquipItem: part={part}, bagID={bag_id}, slot={slot}")
     packets = []
     
     if current_character_id:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
-            # Get character style for prefab ID calculation
-            cursor.execute("SELECT style FROM characters WHERE id = ?", (current_character_id,))
-            char_row = cursor.fetchone()
-            char_style = char_row[0] if char_row else 1
-            
-            # Get all items for this character ordered by their inventory position
-            # Items stay at their original inventory slots (0,1,2,3...).
-            # We do NOT change the slot when equipping.
+            # Get all items for this character
             cursor.execute(
-                "SELECT id, item_type, item_id, quantity, slot FROM items WHERE character_id = ? ORDER BY slot ASC",
+                "SELECT id, item_type, item_id, quantity, slot FROM items WHERE character_id = ?",
                 (current_character_id,)
             )
             all_items = cursor.fetchall()
             
-            print(f"Total items in inventory: {len(all_items)}")
+            debug_log("inventory", f"Total items: {len(all_items)}")
             for i, item in enumerate(all_items):
-                print(f"  Inventory pos {i}: db_id={item[0]}, type={item[1]}, id={item[2]}, slot={item[4]}")
+                loc_type = "EQUIPPED" if item[4] < 9 else f"INV slot {item[4]}"
+                debug_log("inventory", f"  [{i}] db_id={item[0]}, type={item[1]}, id={item[2]}, slot={item[4]} ({loc_type})")
             
             # Validate that the requested part index is valid
             if part not in CLIENT_PART_TO_ITEM_TYPES:
-                print(f"Invalid equipment slot part={part}")
+                debug_log("inventory", f"Invalid equipment slot part={part}")
                 return packets
             
             # Get allowed item types for this slot
             allowed_types = CLIENT_PART_TO_ITEM_TYPES[part]
-            print(f"Slot {part} allows: {allowed_types}")
+            debug_log("inventory", f"Slot {part} allows: {allowed_types}")
             
-            if slot < len(all_items):
-                # Find the item at inventory position 'slot'
-                item_db_id, item_type, item_id, quantity, original_slot = all_items[slot]
-                print(f"Item at pos {slot}: db_id={item_db_id}, type={item_type}, id={item_id}")
-                
-                # Validate that this item type can go in the requested slot
-                if item_type not in allowed_types:
-                    print(f"ERROR: Item type '{item_type}' cannot equip to slot {part} (allowed: {allowed_types})")
-                    return packets
-                
-                print(f"Equipping item {item_db_id} ({item_type}, id={item_id}) to equipment slot {part}")
-                
-                # Send full bag info update so client rebuilds character model with equipped items
-                # This triggers InitPlayerModelEquips() on the NGUI path which attaches 3D models
-                bag_info = build_bag_info()
-                if bag_info:
-                    packets.append(bag_info)
-                    print(f"Sent full bag info after equip")
+            # Map client inventory slot (0-based array index) to DB slot (100-119)
+            db_slot = 100 + slot
+            debug_log("inventory", f"Mapping client slot {slot} to DB slot {db_slot}")
+            
+            # Find the item at the specified inventory slot
+            cursor.execute(
+                "SELECT id, item_type, item_id, quantity, slot FROM items WHERE character_id = ? AND slot = ?",
+                (current_character_id, db_slot)
+            )
+            item = cursor.fetchone()
+            
+            if not item:
+                print(f"ERROR: No item found at DB slot {db_slot} (client slot {slot})")
+                return packets
+            
+            item_db_id, item_type, item_id, quantity, original_slot = item
+            debug_log("inventory", f"Item at inv slot {db_slot}: db_id={item_db_id}, type={item_type}, id={item_id}, current slot={original_slot}")
+            
+            # Verify the item is actually in inventory before equipping
+            if original_slot < 100:
+                debug_log("inventory", f"ERROR: Item {item_db_id} has slot={original_slot} (not in inventory range 100-119)")
+                return packets
+            
+            # Validate that this item is in inventory (not already equipped)
+            if original_slot < 9:
+                debug_log("inventory", f"ERROR: Item {item_db_id} is already equipped at slot {original_slot}")
+                return packets
+            
+            # Validate that this item type can go in the requested slot
+            if item_type not in allowed_types:
+                debug_log("inventory", f"ERROR: Item type '{item_type}' cannot equip to slot {part} (allowed: {allowed_types})")
+                return packets
+            
+            # Check if target equipment slot is already occupied
+            cursor.execute(
+                "SELECT id FROM items WHERE character_id = ? AND slot = ?",
+                (current_character_id, part)
+            )
+            existing_item = cursor.fetchone()
+            if existing_item:
+                debug_log("inventory", f"Equipment slot {part} is occupied by item {existing_item[0]}, unequipping it first")
+                # Unequip the existing item back to inventory
+                next_inv_slot = get_next_inventory_slot()
+                cursor.execute(
+                    "UPDATE items SET slot = ? WHERE character_id = ? AND id = ?",
+                    (next_inv_slot, current_character_id, existing_item[0])
+                )
+            
+            # Move item from inventory to equipment slot
+            debug_log("inventory", f"Equipping item {item_db_id} ({item_type}, id={item_id}) to equipment slot {part}")
+            cursor.execute(
+                "UPDATE items SET slot = ? WHERE character_id = ? AND id = ?",
+                (part, current_character_id, item_db_id)
+            )
+            conn.commit()
+            
+            # Verify the update worked
+            cursor.execute(
+                "SELECT id, slot FROM items WHERE character_id = ? AND id = ?",
+                (current_character_id, item_db_id)
+            )
+            verify = cursor.fetchone()
+            if verify:
+                debug_log("inventory", f"VERIFY: Item {verify[0]} now has slot={verify[1]}")
             else:
-                print(f"Inventory position {slot} out of range ({len(all_items)} items total)")
+                debug_log("inventory", f"ERROR: Item {item_db_id} not found after update!")
+            
+            # Send NotifyItemSwap to client (inventory -> equipment)
+            # Client expects 0-based inventory slots (adds +1 internally)
+            # db_slot is 100-119, so 0-based slot = db_slot - 100
+            inv_slot_0based = db_slot - 100
+            swap_packet = build_notify_item_swap(2, inv_slot_0based, 1, part)
+            packets.append(swap_packet)
+            debug_log("inventory", f"Sent NotifyItemSwap: bagID=2(slot={inv_slot_0based}) -> bagID=1(slot={part})")
+            
+            # Also send full bag info update so client rebuilds character model with equipped items
+            bag_info = build_bag_info()
+            if bag_info:
+                packets.append(bag_info)
+                debug_log("inventory", "Sent full bag info after equip")
         except Exception as e:
             print(f"Error equipping item: {e}")
             import traceback
@@ -1897,6 +2679,61 @@ def handle_equip_item(part, bag_id, slot):
     
     return packets
     
+def build_notify_item_swap(srcbagID, srcslot, dstbagID, dstslot):
+    """Build NotifyItemSwap packet.
+    
+    Args:
+        srcbagID: Source bag ID (1=equipment, 2=inventory, 4=stash)
+        srcslot: Source slot
+        dstbagID: Destination bag ID
+        dstslot: Destination slot
+    """
+    body = PacketWriter()
+    body.write_byte(srcbagID)
+    body.write_uint(srcslot)
+    body.write_byte(dstbagID)
+    body.write_uint(dstslot)
+    return make_game_packet(NOTIFY_ITEM_SWAP, body)
+
+def build_notify_item_update(bagID, item_id, db_id, slot):
+    """Build NotifyItemUpdate packet for a single item.
+    
+    Args:
+        bagID: Bag ID (1=equipment, 2=inventory, 4=stash)
+        item_id: Item template ID
+        db_id: Database item ID (for guid serial)
+        slot: Slot number (0-based for inventory, direct for equipment)
+    """
+    body = PacketWriter()
+    body.write_byte(bagID)
+    # Write SItemInfo structure - use inventory prefab ID (always 1)
+    prefab_id = get_inventory_prefab_id(item_id)
+    body.write_int(item_id)           # ID
+    body.write_int(prefab_id)         # perfrab
+    body.write_uint(1)                # level
+    body.write_ushort(0)              # ItemGuid.worldID
+    body.write_ushort(0)              # ItemGuid.gameID
+    body.write_int(db_id if db_id else item_id)  # ItemGuid.serialID
+    body.write_int(0)                 # enchant
+    body.write_int(0)                 # element
+    body.write_int(0)                 # gem
+    body.write_uint(slot)             # slot
+    body.write_uint(1)                # count
+    body.write_string("")            # property
+    return make_game_packet(NOTIFY_ITEM_UPDATE, body)
+
+def build_notify_item_destroy(bagID, slot):
+    """Build NotifyItemDestroy packet.
+    
+    Args:
+        bagID: Bag ID (1=equipment, 2=inventory, 4=stash)
+        slot: Slot to destroy item from
+    """
+    body = PacketWriter()
+    body.write_byte(bagID)
+    body.write_uint(slot)
+    return make_game_packet(NOTIFY_ITEM_DESTROY, body)
+
 def handle_get_day_reward(day_id):
     """Handle GetDayReward."""
     print(f"GetDayReward: day={day_id}")
@@ -2065,7 +2902,7 @@ def handle_mission_fail_req(mission_id):
 
 def handle_mission_list_req():
     """Handle MissionListReq and send MISSION_LIST_ACK with mission data."""
-    print("MissionListReq")
+    print(f"MissionListReq for character {current_character_id}")
     
     if current_character_id:
         conn = sqlite3.connect(DB_PATH)
@@ -2077,6 +2914,9 @@ def handle_mission_list_req():
                 (current_character_id,)
             )
             rows = cursor.fetchall()
+            print(f"Found {len(rows)} missions in database")
+            for row in rows:
+                print(f"  Mission {row[0]}: status={row[1]}, progress={row[2]}")
             
             body = PacketWriter()
             body.write_int(len(rows))  # count of missions
@@ -2086,16 +2926,22 @@ def handle_mission_list_req():
                 status = row[1]  # 'active', 'completed', etc.
                 progress = row[2]
                 
-                # Build SAcceptMissionRelate structure:
+                # Build SAcceptMissionRelate2 structure:
+                # missionID, coolDownTime, IsHaveCompleted, IsHaveTriggered, star, lastPassTime, canAcceptMaxLvl, lastPassLvl
                 body.write_int(mission_id)           # missionID
+                body.write_int(0)                    # coolDownTime
                 body.write_int(0 if status == 'active' else 1)  # IsHaveCompleted (0=no, 1=yes)
                 body.write_bool(status == 'active')  # IsHaveTriggered (true if active)
                 body.write_int(1)                    # star (default 1 for tutorial)
                 body.write_int(0)                    # lastPassTime
                 body.write_int(2)                    # canAcceptMaxLvl
+                body.write_int(0)                    # lastPassLvl
             
             conn.close()
-            return make_game_packet(MISSION_LIST_ACK, body)
+            pkt = make_game_packet(MISSION_LIST_ACK, body)
+            print(f"MISSION_LIST_ACK: {len(rows)} missions, packet size={len(pkt)}, body_size={len(body.get_bytes())}")
+            print(f"MISSION_LIST_ACK bytes: {pkt.hex()}")
+            return pkt
         except Exception as e:
             print(f"Error getting mission list: {e}")
             import traceback
@@ -2427,65 +3273,188 @@ def handle_study_ability(ability_id):
     response = make_game_packet(STUDY_ABILITY_SUCCEED, body)
     return response
 
-def handle_swap_item(item_uuid1, item_uuid2):
-    """Handle SwapItem."""
-    print(f"SwapItem: uuid1={item_uuid1}, uuid2={item_uuid2}")
+def handle_swap_item(srcbagID, srcslot, dstbagID, dstslot):
+    """Handle SwapItem - swap items between bags.
+    
+    Args:
+        srcbagID: Source bag ID (1=equipment, 2=inventory, 4=stash)
+        srcslot: Source slot
+        dstbagID: Destination bag ID
+        dstslot: Destination slot
+    """
+    debug_log("inventory", f"SwapItem: bagID={srcbagID}(slot={srcslot}) -> bagID={dstbagID}(slot={dstslot})")
+    packets = []
     
     if current_character_id:
+        # Dedup check: skip if same swap was just processed within 500ms
+        now = time.time()
+        last_swap = _last_swap_time.get(current_character_id)
+        if last_swap and (now - last_swap[2]) < 0.5:
+            if last_swap[0] == srcslot and last_swap[1] == dstslot:
+                debug_log("inventory", "Duplicate swap detected, skipping")
+                return packets
+        else:
+            # Clear old swap tracking if > 500ms ago
+            if last_swap and (now - last_swap[2]) >= 0.5:
+                del _last_swap_time[current_character_id]
+        
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
-            # Get slots
-            cursor.execute(
-                "SELECT slot FROM items WHERE character_id = ? AND id = ?",
-                (current_character_id, item_uuid1)
-            )
-            row1 = cursor.fetchone()
+            # Validate slot ranges
+            if srcbagID == 2 and not (0 <= srcslot <= 19):
+                print(f"ERROR: Invalid source inventory slot {srcslot} (must be 0-19)")
+                return packets
+            if dstbagID == 2 and not (0 <= dstslot <= 19):
+                print(f"ERROR: Invalid dest inventory slot {dstslot} (must be 0-19)")
+                return packets
             
-            cursor.execute(
-                "SELECT slot FROM items WHERE character_id = ? AND id = ?",
-                (current_character_id, item_uuid2)
-            )
-            row2 = cursor.fetchone()
+            # Map client slot numbers to DB slots
+            src_db_slot = srcslot
+            dst_db_slot = dstslot
             
-            if row1 and row2:
-                # Swap slots
+            # For inventory (bagID=2), client sends 0-based but we use 100-119
+            if srcbagID == 2:
+                src_db_slot = 100 + srcslot
+            if dstbagID == 2:
+                dst_db_slot = 100 + dstslot
+            
+            debug_log("inventory", f"Mapped: srcbag={srcbagID}(slot={srcslot}->{src_db_slot}), dstbag={dstbagID}(slot={dstslot}->{dst_db_slot})")
+            
+            # Log full inventory state before swap
+            cursor.execute("SELECT id, item_type, slot FROM items WHERE character_id = ? ORDER BY slot", (current_character_id,))
+            pre_state = cursor.fetchall()
+            debug_log("inventory", f"PRE-SWAP inventory: {[(i[0], i[1], i[2]) for i in pre_state]}")
+            
+            # Get source item
+            cursor.execute(
+                "SELECT id, item_type, item_id, quantity FROM items WHERE character_id = ? AND slot = ?",
+                (current_character_id, src_db_slot)
+            )
+            src_item = cursor.fetchone()
+            
+            # Get destination item (if any)
+            cursor.execute(
+                "SELECT id, item_type, item_id, quantity FROM items WHERE character_id = ? AND slot = ?",
+                (current_character_id, dst_db_slot)
+            )
+            dst_item = cursor.fetchone()
+            
+            if not src_item:
+                print(f"ERROR: No source item at bagID={srcbagID}, slot={srcslot}")
+                return packets
+            
+            src_id, src_type, src_item_id, src_qty = src_item
+            dst_id = dst_item[0] if dst_item else None
+            
+            debug_log("inventory", f"Swapping: item {src_id} (type={src_type}) from slot {src_db_slot} <-> item {dst_id} at slot {dst_db_slot}")
+            
+            # Perform the swap in DB
+            cursor.execute(
+                "UPDATE items SET slot = ? WHERE character_id = ? AND id = ?",
+                (dst_db_slot, current_character_id, src_id)
+            )
+            
+            if dst_item:
                 cursor.execute(
                     "UPDATE items SET slot = ? WHERE character_id = ? AND id = ?",
-                    (row2[0], current_character_id, item_uuid1)
+                    (src_db_slot, current_character_id, dst_id)
                 )
-                cursor.execute(
-                    "UPDATE items SET slot = ? WHERE character_id = ? AND id = ?",
-                    (row1[0], current_character_id, item_uuid2)
-                )
+                print(f"Swapping item {src_id} <-> item {dst_id}")
+            else:
+                # Moving to empty slot
+                debug_log("inventory", f"Moving item {src_id} to empty slot {dst_db_slot}")
             
             conn.commit()
+            
+            # Log full inventory state after swap
+            cursor.execute("SELECT id, item_type, slot FROM items WHERE character_id = ? ORDER BY slot", (current_character_id,))
+            post_state = cursor.fetchall()
+            debug_log("inventory", f"POST-SWAP inventory: {[(i[0], i[1], i[2]) for i in post_state]}")
+            
+            # Track this swap to prevent duplicates
+            _last_swap_time[current_character_id] = (srcslot, dstslot, now)
+            
+            # Always use NotifyItemSwap - it handles both item↔item and item↔empty correctly
+            src_notify_slot = srcslot
+            dst_notify_slot = dstslot
+            swap_packet = build_notify_item_swap(srcbagID, src_notify_slot, dstbagID, dst_notify_slot)
+            packets.append(swap_packet)
+            debug_log("inventory", f"Sent NotifyItemSwap: bagID={srcbagID}(slot={src_notify_slot}) -> bagID={dstbagID}(slot={dst_notify_slot})")
+            
+            # Also send full bag info update
+            bag_info = build_bag_info()
+            if bag_info:
+                packets.append(bag_info)
+                debug_log("inventory", "Sent full bag info after swap")
         except Exception as e:
             print(f"Error swapping items: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             conn.close()
     
-    # No specific response needed
+    return packets
     
 def handle_unequip_item(slot):
-    """Handle UnequipItem."""
-    print(f"UnequipItem: slot={slot}")
+    """Handle UnequipItem - move item from equipment slot back to inventory.
+    
+    Args:
+        slot: Equipment slot index (0-8) to unequip from
+    """
+    debug_log("inventory", f"UnequipItem: slot={slot}")
+    packets = []
     
     if current_character_id:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         try:
+            # Find the item currently equipped at this slot
             cursor.execute(
-                "UPDATE items SET slot = -1 WHERE character_id = ? AND slot = ?",
+                "SELECT id, item_type, item_id, quantity FROM items WHERE character_id = ? AND slot = ?",
                 (current_character_id, slot)
             )
-            conn.commit()
+            item = cursor.fetchone()
+            
+            if item:
+                item_db_id, item_type, item_id, quantity = item
+                debug_log("inventory", f"Unequipping item {item_db_id} ({item_type}, id={item_id}) from equipment slot {slot}")
+                
+                # Move to next available inventory slot
+                inv_slot = get_next_inventory_slot()
+                cursor.execute(
+                    "UPDATE items SET slot = ? WHERE character_id = ? AND id = ?",
+                    (inv_slot, current_character_id, item_db_id)
+                )
+                conn.commit()
+                debug_log("inventory", f"Moved to inventory slot {inv_slot}")
+                
+                # Send NotifyItemSwap to client (equipment -> inventory)
+                # Client expects 0-based inventory slots (adds +1 internally)
+                # inv_slot is 100-119, so 0-based slot = inv_slot - 100
+                inv_slot_0based = inv_slot - 100
+                swap_packet = build_notify_item_swap(1, slot, 2, inv_slot_0based)
+                packets.append(swap_packet)
+                debug_log("inventory", f"Sent NotifyItemSwap: bagID=1(slot={slot}) -> bagID=2(slot={inv_slot_0based})")
+                
+                # Send full bag info update
+                debug_log("inventory", "Sending bag info update after unequip")
+                bag_info = build_bag_info()
+                if bag_info:
+                    packets.append(bag_info)
+                    debug_log("inventory", f"Bag info packet built, size={len(bag_info)} bytes")
+                else:
+                    debug_log("inventory", "ERROR: Bag info is None!")
+            else:
+                debug_log("inventory", f"No item equipped at slot {slot}")
         except Exception as e:
             print(f"Error unequipping item: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             conn.close()
     
-    # No specific response needed
+    return packets
     
 def handle_upgrade_well(well_type):
     """Handle UpgradeWell."""
@@ -2934,13 +3903,28 @@ def handle_client(conn, addr):
                             else:
                                 map_name, _ = parse_string(packet_body, offset)
                                 print(f"EnterScene: map={map_name}")
-                                response = handle_enter_scene(map_name)
-                                conn.sendall(response)
+                                responses = handle_enter_scene(map_name)
+                                print(f"[NET] EnterScene sending {len(responses)} packets")
+                                for i, resp in enumerate(responses):
+                                    method_id_check = struct.unpack_from('<I', resp, 6)[0]
+                                    if method_id_check == 0x3ee28776:  # BREAKABLE_ACTOR_ENTER
+                                        print(f"[NET] Sent breakable actor packet (EnterScene) size={len(resp)}")
+                                    conn.sendall(resp)
                         elif method_id == MAP_LOAD_OK:
                             # Client finished loading the scene - send CharacterStartInfo + spawn entities
                             print(f"MapLoadOK from {addr}")
                             responses = handle_map_load_ok()
-                            for resp in responses:
+                            print(f"[NET] Sending {len(responses)} packets to client")
+                            for i, resp in enumerate(responses):
+                                # Log method ID and type for debugging
+                                # Packet structure: [4 bytes size][2 bytes type][method_id][body...]
+                                packet_type = struct.unpack_from('<H', resp, 4)[0]
+                                method_id_check = struct.unpack_from('<I', resp, 6)[0]
+                                
+                                if method_id_check == 0x3ee28776:  # BREAKABLE_ACTOR_ENTER
+                                    print(f"[NET] Sent breakable actor packet {i} (type={packet_type}, size={len(resp)})")
+                                elif i < 5 or method_id_check in [0x4f8580ad, 0x3ee28776]:  # Log first few + key packets
+                                    print(f"[NET] Packet {i}: type={packet_type}, method=0x{method_id_check:08x} (size={len(resp)})")
                                 conn.sendall(resp)
                         elif method_id == TUTORIAL_ENTER_REQ:
                             # Client requests to enter tutorial, send ack
@@ -2990,11 +3974,21 @@ def handle_client(conn, addr):
                             response = handle_buy_char_slot_request()
                             conn.sendall(response)
                         elif method_id == BUY_CONSUME_ITEM:
-                            if len(packet_body) >= 12:
-                                item_id = struct.unpack_from('<i', packet_body, 4)[0]
-                                quantity = struct.unpack_from('<i', packet_body, 8)[0]
-                                response = handle_buy_consume_item(item_id, quantity)
-                                conn.sendall(response)
+                            # packet_body includes methodID at offset 0-3
+                            # Format: [methodID(4)][consumeType(4)][itemID(4)][buyCount(4)]
+                            print(f"[BUY] Received BuyConsumeItem, len={len(packet_body)}")
+                            if len(packet_body) >= 16:
+                                consume_type = struct.unpack_from('<i', packet_body, 4)[0]
+                                item_id = struct.unpack_from('<i', packet_body, 8)[0]
+                                quantity = struct.unpack_from('<i', packet_body, 12)[0]
+                                debug_log("inventory", f"BuyConsumeItem: type={consume_type}, item={item_id}, qty={quantity}")
+                                try:
+                                    result_packets = handle_buy_consume_item(consume_type, item_id, quantity)
+                                    if result_packets:
+                                        for pkt in result_packets:
+                                            conn.sendall(pkt)
+                                except Exception as e:
+                                    print(f"Error in BUY_CONSUME_ITEM handler: {e}")
                         elif method_id == BUY_ITEM:
                             if len(packet_body) >= 8:
                                 item_id = struct.unpack_from('<i', packet_body, 4)[0]
@@ -3017,9 +4011,19 @@ def handle_client(conn, addr):
                                 response = handle_change_name_req(name)
                                 conn.sendall(response)
                         elif method_id == CHAT_REQUEST:
-                            # Parse channel and message (simplified)
-                            response = handle_chat_request(0, "")
-                            conn.sendall(response)
+                            # Parse chat request from packet body
+                            # Format: [methodID(4)][chatType(4)][targetID(4)][itemID(4)][string chatMsg]
+                            # packet_body already includes methodID at offset 0, so skip it
+                            if len(packet_body) >= 16:  # methodID(4) + 3 ints(12) before string
+                                chat_type = struct.unpack_from('<i', packet_body, 4)[0]
+                                target_id = struct.unpack_from('<i', packet_body, 8)[0]
+                                item_id = struct.unpack_from('<i', packet_body, 12)[0]
+                                message, _ = parse_string(packet_body, 16)
+                                if message is not None:
+                                    print(f"ChatRequest: type={chat_type}, target={target_id}, item={item_id}, msg='{message}'")
+                                    response = handle_chat_request(chat_type, target_id, item_id, message, conn, addr)
+                                    if response:
+                                        conn.sendall(response)
                         elif method_id == CRAFTING_ITEM:
                             if len(packet_body) >= 8:
                                 recipe_id = struct.unpack_from('<i', packet_body, 4)[0]
@@ -3040,7 +4044,7 @@ def handle_client(conn, addr):
                                 part = struct.unpack_from('B', packet_body, 4)[0]   # equipment slot
                                 bag_id = struct.unpack_from('B', packet_body, 5)[0]  # bag ID (2=inventory)
                                 slot = struct.unpack_from('<I', packet_body, 6)[0]   # slot in bag
-                                print(f"EquipItem: part={part}, bagID={bag_id}, slot={slot}")
+                                debug_log("inventory", f"EquipItem: part={part}, bagID={bag_id}, slot={slot}")
                                 result_packets = handle_equip_item(part, bag_id, slot)
                                 if result_packets:
                                     for pkt in result_packets:
@@ -3123,9 +4127,15 @@ def handle_client(conn, addr):
                             response = handle_role_pet_list_req()
                             conn.sendall(response)
                         elif method_id == SALE_ITEM:
-                            if len(packet_body) >= 8:
-                                item_uuid = struct.unpack_from('<i', packet_body, 4)[0]
-                                handle_sale_item(item_uuid)
+                            # Packet format: [4-byte prefix][bagID(1)][slot(4)]
+                            if len(packet_body) >= 9:
+                                bag_id = struct.unpack_from('B', packet_body, 4)[0]
+                                slot = struct.unpack_from('<I', packet_body, 5)[0]
+                                debug_log("inventory", f"SaleItem: bagID={bag_id}, slot={slot}")
+                                result_packets = handle_sell_item(bag_id, slot)
+                                if result_packets:
+                                    for pkt in result_packets:
+                                        conn.sendall(pkt)
                         elif method_id == SEND_MAIL:
                             # Simplified parsing
                             response = handle_send_mail(0, "", "")
@@ -3146,14 +4156,30 @@ def handle_client(conn, addr):
                                 response = handle_study_ability(ability_id)
                                 conn.sendall(response)
                         elif method_id == SWAP_ITEM:
-                            if len(packet_body) >= 12:
-                                item_uuid1 = struct.unpack_from('<i', packet_body, 4)[0]
-                                item_uuid2 = struct.unpack_from('<i', packet_body, 8)[0]
-                                handle_swap_item(item_uuid1, item_uuid2)
+                            # Packet format: [methodID(4)][srcbagID(1)][srcslot(4)][dstbagID(1)][dstslot(4)]
+                            if len(packet_body) >= 10:
+                                srcbagID = struct.unpack_from('B', packet_body, 4)[0]
+                                srcslot = struct.unpack_from('<I', packet_body, 5)[0]
+                                dstbagID = struct.unpack_from('B', packet_body, 9)[0]
+                                dstslot = struct.unpack_from('<I', packet_body, 10)[0] if len(packet_body) >= 14 else 0
+                                debug_log("inventory", f"SwapItem: bagID={srcbagID}(slot={srcslot}) -> bagID={dstbagID}(slot={dstslot})")
+                                result_packets = handle_swap_item(srcbagID, srcslot, dstbagID, dstslot)
+                                if result_packets:
+                                    for pkt in result_packets:
+                                        conn.sendall(pkt)
                         elif method_id == UNEQUIP_ITEM:
-                            if len(packet_body) >= 8:
-                                slot = struct.unpack_from('<i', packet_body, 4)[0]
-                                handle_unequip_item(slot)
+                            # Packet format: [methodID(4)][part(1)][bagID(1)][slot(4)]
+                            if len(packet_body) >= 9:
+                                part = struct.unpack_from('B', packet_body, 4)[0]   # equipment slot
+                                bag_id = struct.unpack_from('B', packet_body, 5)[0]  # bag ID
+                                slot = struct.unpack_from('<I', packet_body, 6)[0]   # slot in bag
+                                debug_log("inventory", f"UnequipItem: part={part}, bagID={bag_id}, slot={slot}")
+                                result_packets = handle_unequip_item(part)
+                                debug_log("inventory", f"UnequipItem returned {len(result_packets) if result_packets else 0} packets")
+                                if result_packets:
+                                    for pkt in result_packets:
+                                        debug_log("inventory", f"Sending unequip response packet, size={len(pkt)} bytes")
+                                        conn.sendall(pkt)
                         elif method_id == UPGRADE_WELL:
                             if len(packet_body) >= 8:
                                 well_type = struct.unpack_from('<i', packet_body, 4)[0]
@@ -3285,28 +4311,41 @@ def handle_client(conn, addr):
                                 response = build_packet(DELETE_MAIL_ACK, struct.pack('<i', 1))
                                 conn.sendall(response)
                         
-                        # Battle protocol handlers
+                        # Battle protocol handlers - IGNORED (battle-only, not for normal movement)
                         elif method_id == MOVE_UNIT:
-                            if len(packet_body) >= 4:
-                                print(f"MoveUnit from {addr}")
-                                # Echo back position update acknowledgment with expected format
-                                # Client expects: [int result][float x][float y][float z]
-                                resp_body = struct.pack('<ifff', 1, 0.0, 0.0, 0.0)
-                                response = build_packet(UPDATE_MOVE_RESULT, resp_body)
-                                conn.sendall(response)
+                            print(f"[IGNORE] MoveUnit from {addr} - requires battle protocol")
                         elif method_id == UPDATE_MOVE_REQUEST:
-                            if len(packet_body) >= 16:  # At least x,y,z floats (4 bytes each)
-                                # Parse position from packet: [4 bytes method][12 bytes pos(x,y,z)]
+                            if len(packet_body) >= 16:
                                 px = struct.unpack_from('<f', packet_body, 4)[0]
                                 py = struct.unpack_from('<f', packet_body, 8)[0]
                                 pz = struct.unpack_from('<f', packet_body, 12)[0]
-                                print(f"[POSITION] Player at ({px:.2f}, {py:.2f}, {pz:.2f}) on map '{current_map_name}'")
-                                # Acknowledge movement update with position echo
-                                resp_body = struct.pack('<ifff', 1, px, py, pz)
-                                response = build_packet(UPDATE_MOVE_RESULT, resp_body)
-                                conn.sendall(response)
+                                print(f"[MOVE] Player at ({px:.2f}, {py:.2f}, {pz:.2f})")
+                                
+                                # Check if player entered any trigger zones
+                                if current_character_id and current_map_name:
+                                    triggered = trigger_manager.check_player_in_trigger(
+                                        current_character_id, current_map_name,
+                                        (px, py, pz)
+                                    )
+                                    
+                                    if triggered:
+                                        print(f"[TRIGGER] Player activated {len(triggered)} triggers")
+                                        # Open any gates connected to these triggers
+                                        opened_gates = []
+                                        for trigger_id in triggered:
+                                            gate_id = trigger_manager.get_trigger_gate_id(
+                                                current_character_id, current_map_name, trigger_id
+                                            )
+                                            if gate_id and gate_id > 0:
+                                                if gate_manager.open_gate_by_id(
+                                                    current_character_id, current_map_name, gate_id
+                                                ):
+                                                    opened_gates.append(gate_id)
+                                        
+                                        if opened_gates:
+                                            print(f"[GATE] {len(opened_gates)} gates opened by triggers: {opened_gates}")
                             else:
-                                print(f"UpdateMoveRequest: packet too small ({len(packet_body)} bytes) from {addr}")
+                                print(f"[IGNORE] UpdateMoveRequest: packet too small from {addr}")
                         elif method_id == PICKUP_ITEM_REQ:
                             if len(packet_body) >= 8:
                                 item_uuid = struct.unpack_from('<i', packet_body, 4)[0]
@@ -3406,6 +4445,16 @@ def handle_client(conn, addr):
                             if len(packet_body) >= 4:
                                 print(f"SetSkillShortcut from {addr}")
                                 # No specific response needed
+                        elif method_id == SPAWNNER_KILLED:
+                            # Monster was killed - check if any gates should open
+                            if current_character_id and current_map_name:
+                                opened_gates = gate_manager.record_monster_kill(
+                                    current_character_id, current_map_name
+                                )
+                                
+                                if opened_gates:
+                                    print(f"[GATE] {len(opened_gates)} gates opened due to monster kill")
+                                    # TODO: Send gate state update to client
                         elif method_id == PLAYER_USE_COOL_WEAPON_REQ:
                             if len(packet_body) >= 4:
                                 print(f"PlayerUseCoolWeaponReq from {addr}")

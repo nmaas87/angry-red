@@ -32,7 +32,7 @@ Add these entries to `C:\Windows\System32\drivers\etc\hosts` (run editor as Admi
 
 ### Python Environment
 
-Uses the system Python at: `C:/Users/<>/AppData/Local/Python/bin/python.exe`
+Uses the system Python at: `C:/Users/<>>/AppData/Local/Python/bin/python.exe`
 
 No external dependencies required — only uses Python standard library (`socket`, `sqlite3`, `struct`, etc.).
 
